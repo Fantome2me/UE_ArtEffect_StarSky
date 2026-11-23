@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026. Star Sky / Aurora / Nebula sky for UE.
+// Copyright (c) 2026. Star Sky / Aurora / Nebula sky for UE.
 //
 // 逐行直译自 Unity 版 Assets/StarNestSkybox.shader（内部名 Skybox/AuroraStarNest）。
 // 参数与颜色以 **方案文档 v2 的「材质实际」值** 为准（不是 shader 默认值）。
@@ -396,7 +396,26 @@ void MainCS(uint3 id : SV_DispatchThreadID)
 	}
 
 	const float2 ScaledUVs = ((float2(id.xy) + 0.5f) / float(CubeSize)) * 2.0f - 1.0f;
-	const float3 rd = normalize(NTA_CubeFaceDirection(ScaledUVs, (int)id.z));
+
+	// -----------------------------------------------------------------------
+	// ★ 坐标轴换算：UE 是 Z-up，这套 StarNest / 极光数学是 Y-up
+	//
+	// 原始 Unity shader 里 rd.y 代表「高度」，所有地平线判断都基于它：
+	//   · rd.y > 0 才走极光正常混合，否则走下半球镜像 + 地面雾
+	//   · NTA_Aurora 末尾有 clamp(rd.y*15 + 0.4, 0, 1) 的「只在地平线以上」闸门
+	//
+	// 之前把 UE 世界方向原样喂进去，导致 rd.y 其实是「世界 Y 轴（右）」，
+	// 于是那条地平线判断切的是一个穿过 Y 轴的竖直平面 —— 天空里多出一堵墙，
+	// 在 yaw = 0 的机位上正好投影成画面正中的一条硬边。
+	//
+	// 换算 (X, Y, Z)_UE -> (X, Z, -Y)：
+	//   · UE 的 +Z（上）  -> shader 的 +Y（上）      ✅ 高度轴对上
+	//   · 变换矩阵行列式 = +1，是纯旋转、不镜像       ✅ 星云不会被镜像
+	//
+	// 注意 NTA_RAY_ORIGIN 保持在 shader 的 Y-up 空间里不动（原 shader 就是 (0,0,-6.7)）。
+	// -----------------------------------------------------------------------
+	const float3 rdWorld = normalize(NTA_CubeFaceDirection(ScaledUVs, (int)id.z));
+	const float3 rd = float3(rdWorld.x, rdWorld.z, -rdWorld.y);
 
 	float3 col = NTA_SkyColor(rd, NTA_RAY_ORIGIN, SkyTime);
 
