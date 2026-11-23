@@ -26,6 +26,8 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_UAV(RWTexture2DArray<float4>, RWOutput)
 		SHADER_PARAMETER(uint32, CubeSize)
+		/** 本次 dispatch 的起始面（0..5）。按面调度时一次只烘 1 个面，把单帧峰值压下去。 */
+		SHADER_PARAMETER(uint32, CubeFaceBase)
 		SHADER_PARAMETER(float, SkyTime)
 	END_SHADER_PARAMETER_STRUCT()
 

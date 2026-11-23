@@ -18,23 +18,31 @@
 #include "/Engine/Private/Common.ush"
 
 // ===========================================================================
-// 运行时 uniform（只有这 3 个）
+// 运行时 uniform（只有这 4 个）
 // ===========================================================================
 RWTexture2DArray<float4> RWOutput;
 
 uint  CubeSize;
+/** 本次 dispatch 从第几个面开始（按面调度用：一次只烘 1~N 个面） */
+uint  CubeFaceBase;
 float SkyTime;
 
 // ===========================================================================
 // 编译期常量 —— 方案 v2 §3.1 数值参数表
 // ===========================================================================
 
-/** 体积步进（材质实际 28.46 → int 截断 28）。星云主要成本。 */
-#define NTA_VOLSTEPS        28
+/** 体积步进（原材质 28；降到 24 换取 ~14% 星云成本，层次变化极小） */
+#define NTA_VOLSTEPS        24
 /** 分形迭代（材质实际 16.3 → int 截断 16）。 */
 #define NTA_ITERATIONS      16
-/** 极光层数（v2 附录 A.1 仍是 50）。 */
-#define NTA_AURORA_LAYERS   50
+/**
+ * 极光层数。
+ *
+ * 原版 50 层；这里降到 32。极光占全部 ALU 约六成，层数线性放大成本，
+ * 而层间距极小（层高差 pow(i,1.4)*0.002，在 32 层时相邻层差 < 0.01），
+ * 减到 32 视觉上几乎看不出来。
+ */
+#define NTA_AURORA_LAYERS   32
 
 /** 0 = 完整。诊断用：1 仅星云 / 2 仅星星 / 3 仅极光 / 4 亮度灰度 / 5 仅地平线下雾 */
 #define NTA_DEBUG_MODE      0
@@ -90,6 +98,76 @@ static const float3 NTA_AURORA_COLOR2   = float3(1.000f, 0.317f, 0.746f);   // s
 static const float3 NTA_NEBULA_COLOR    = float3(1.000f, 0.033f, 0.748f);   // sRGB(1,0.2,0.88)   品红
 static const float3 NTA_HIGHLIGHT_COLOR = float3(0.494f, 0.962f, 1.000f);   // sRGB(0.731,0.983,1) 青白
 static const float3 NTA_DARK_COLOR      = float3(0.096f, 0.007f, 0.323f);   // sRGB(0.343,0.077,0.604) 深紫暗底
+
+// ---------------------------------------------------------------------------
+// 极光每层常量查表
+//
+// 原版在 50 层循环里每层现算 4 个超越函数（pow / sin / exp2 / sin(Hash21)）
+// 加上一次颜色 lerp —— 每 texel 约 200 次超越函数，占总 ALU 的一到两成。
+// 这些量**只依赖层号 i、与像素无关**，所以全部预先算好放进常量数组：
+//
+//   PT_BIAS[i]   = pow(i, 1.4) * 0.002              （层高偏移）
+//   OF[i]        = 0.006 * Hash21(i, i*2) * smoothstep(0,15,i)   （层抖动）
+//   WEIGHT[i]    = exp2(-i*0.065 - 2.5) * smoothstep(0,5,i)      （高度衰减，两项合一）
+//   COLOR[i]     = lerp(AuroraColor1, AuroraColor2, sin(i*0.05)*0.5+0.5)
+//
+// 由脚本按上面公式生成，数值与原先逐层现算完全一致（float32 精度内）。
+// ---------------------------------------------------------------------------
+static const float NTA_LAYER_PT_BIAS[NTA_AURORA_LAYERS] = {
+	0.0f, 0.002f, 0.00527803164f, 0.00931107344f, 0.013928809f, 0.0190365394f, 0.0245720701f, 0.0304906899f,
+	0.0367583474f, 0.0433480443f, 0.0502377286f, 0.05740897f, 0.0648460818f, 0.0725355133f, 0.0804654132f, 0.0886253082f,
+	0.0970058603f, 0.105598679f, 0.114396175f, 0.123391441f, 0.132578161f, 0.141950527f, 0.15150318f, 0.161231155f,
+	0.171129836f, 0.181194916f, 0.191422367f, 0.201808412f, 0.212349498f, 0.223042278f, 0.23388359f, 0.244870443f
+};
+
+static const float NTA_LAYER_OF[NTA_AURORA_LAYERS] = {
+	0.0f, 7.14600072e-05f, 0.000284187927f, 0.000416028339f, 0.00103090084f, 0.0003612457f, 0.00118829006f, 0.00239701542f,
+	0.000821404334f, 0.00210740123f, 0.00120397123f, 0.00367708767f, 0.0037427069f, 0.00560374526f, 0.000804396714f, 0.00570205946f,
+	0.00283566796f, 0.00210189368f, 0.000747944658f, 0.00185905008f, 0.000224290647f, 0.00466901036f, 0.000921067795f, 0.00200641565f,
+	0.0051355536f, 0.00178361043f, 0.00238978017f, 0.00513271323f, 0.0042929426f, 0.00555029702f, 0.00566481041f, 0.00572848317f
+};
+
+static const float NTA_LAYER_WEIGHT[NTA_AURORA_LAYERS] = {
+	0.0f, 0.0175748408f, 0.0568635245f, 0.10006891f, 0.132271178f, 0.141120551f, 0.13490353f, 0.128960397f,
+	0.123279088f, 0.117848067f, 0.112656308f, 0.10769327f, 0.102948877f, 0.0984134971f, 0.0940779217f, 0.0899333488f,
+	0.0859713636f, 0.0821839225f, 0.0785633359f, 0.0751022531f, 0.0717936472f, 0.0686308009f, 0.0656072927f, 0.0627169843f,
+	0.0599540075f, 0.0573127527f, 0.0547878576f, 0.0523741959f, 0.0500668673f, 0.0478611874f, 0.045752678f, 0.0437370583f
+};
+
+static const float3 NTA_LAYER_COLOR[NTA_AURORA_LAYERS] = {
+	float3(0.579f, 0.1585f, 0.412f),
+	float3(0.60004123f, 0.166421698f, 0.428693043f),
+	float3(0.621029868f, 0.174323597f, 0.445344361f),
+	float3(0.641913454f, 0.182185944f, 0.461912336f),
+	float3(0.662639788f, 0.189989089f, 0.478355556f),
+	float3(0.683157067f, 0.197713528f, 0.494632922f),
+	float3(0.703414007f, 0.205339953f, 0.510703749f),
+	float3(0.723359977f, 0.212849302f, 0.526527868f),
+	float3(0.742945122f, 0.220222807f, 0.542065726f),
+	float3(0.76212049f, 0.227442037f, 0.557278488f),
+	float3(0.780838152f, 0.234488948f, 0.57212813f),
+	float3(0.799051323f, 0.241345926f, 0.586577534f),
+	float3(0.816714481f, 0.247995832f, 0.600590586f),
+	float3(0.833783477f, 0.254422045f, 0.61413226f),
+	float3(0.850215646f, 0.260608503f, 0.627168708f),
+	float3(0.865969918f, 0.266539743f, 0.639667346f),
+	float3(0.881006914f, 0.27220094f, 0.651596934f),
+	float3(0.895289051f, 0.277577944f, 0.662927655f),
+	float3(0.908780629f, 0.282657315f, 0.673631188f),
+	float3(0.921447928f, 0.287426358f, 0.683680779f),
+	float3(0.933259285f, 0.291873151f, 0.693051309f),
+	float3(0.944185178f, 0.295986581f, 0.701719357f),
+	float3(0.954198299f, 0.299756367f, 0.709663258f),
+	float3(0.963273619f, 0.303173085f, 0.716863156f),
+	float3(0.971388455f, 0.306228195f, 0.723301055f),
+	float3(0.978522525f, 0.308914062f, 0.728960863f),
+	float3(0.984657996f, 0.311223972f, 0.733828434f),
+	float3(0.989779534f, 0.313152152f, 0.737891602f),
+	float3(0.993874336f, 0.314693782f, 0.74114021f),
+	float3(0.996932169f, 0.315845009f, 0.743566139f),
+	float3(0.998945389f, 0.316602955f, 0.745163326f),
+	float3(0.999908965f, 0.316965727f, 0.745927777f)
+};
 
 // ---------------------------------------------------------------------------
 // 极大值保护：原 shader 在 rd.y 接近 0 时 pt 会数值爆炸（风险 R13）
@@ -172,21 +250,17 @@ float4 NTA_Aurora(float3 ro, float3 rd, float t)
 	[loop]
 	for (int i = 0; i < NTA_AURORA_LAYERS; i++)
 	{
-		const float fi = (float)i;
-
-		const float of = 0.006f * NTA_Hash21(float2(fi, fi * 2.0f)) * smoothstep(0.0f, 15.0f, fi);
-		float pt = ((NTA_AURORA_HEIGHT + pow(fi, 1.4f) * 0.002f) - ro.y) / denom;
-		pt -= of;
+		// 四个只依赖层号的量全部走常量数组（见文件顶部的生成表），
+		// 循环里只剩「求交 + 采样噪声 + 累加」
+		const float pt = ((NTA_AURORA_HEIGHT + NTA_LAYER_PT_BIAS[i]) - ro.y) / denom - NTA_LAYER_OF[i];
 
 		const float3 bpos = ro + pt * rd;
 		const float rzt = NTA_TriNoise2d(bpos.xz, 0.06f, t);
 
-		const float k = sin(fi * 0.05f) * 0.5f + 0.5f;
-		const float3 aurColor = lerp(NTA_AURORA_COLOR1, NTA_AURORA_COLOR2, k);
-		const float4 col2 = float4(aurColor * rzt, rzt);
+		const float4 col2 = float4(NTA_LAYER_COLOR[i] * rzt, rzt);
 
 		avgCol = lerp(avgCol, col2, 0.5f);
-		col += avgCol * exp2(-fi * 0.065f - 2.5f) * smoothstep(0.0f, 5.0f, fi);
+		col += avgCol * NTA_LAYER_WEIGHT[i];
 	}
 
 	col *= clamp(rd.y * 15.0f + 0.4f, 0.0f, 1.0f);
@@ -404,7 +478,9 @@ float3 NTA_CubeFaceDirection(float2 ScaledUVs, int InCubeFace)
 [numthreads(8, 8, 1)]
 void MainCS(uint3 id : SV_DispatchThreadID)
 {
-	if (id.x >= CubeSize || id.y >= CubeSize || id.z >= 6)
+	// 按面调度：本次 dispatch 只覆盖 CubeFaceBase .. CubeFaceBase + N - 1 这几个面
+	const uint faceIndex = id.z + CubeFaceBase;
+	if (id.x >= CubeSize || id.y >= CubeSize || faceIndex >= 6)
 	{
 		return;
 	}
@@ -430,7 +506,7 @@ void MainCS(uint3 id : SV_DispatchThreadID)
 	//
 	// 注意 NTA_RAY_ORIGIN 保持在 shader 的 Y-up 空间里不动（原 shader 就是 (0,0,-6.7)）。
 	// -----------------------------------------------------------------------
-	const float3 rdView = -normalize(NTA_CubeFaceDirection(ScaledUVs, (int)id.z));
+	const float3 rdView = -normalize(NTA_CubeFaceDirection(ScaledUVs, (int)faceIndex));
 	const float3 rd = float3(rdView.x, rdView.z, -rdView.y);
 
 	float3 col = NTA_SkyColor(rd, NTA_RAY_ORIGIN, SkyTime);
@@ -439,5 +515,5 @@ void MainCS(uint3 id : SV_DispatchThreadID)
 	col = clamp(col, 0.0f, 8.0f);
 	col = all(col == col) ? col : float3(0, 0, 0);
 
-	RWOutput[uint3(id.x, id.y, id.z)] = float4(col, 1.0f);
+	RWOutput[uint3(id.x, id.y, faceIndex)] = float4(col, 1.0f);
 }

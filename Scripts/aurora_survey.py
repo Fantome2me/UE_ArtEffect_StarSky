@@ -58,10 +58,12 @@ def on_tick(delta_seconds):
     _state["frame"] += 1
     f = _state["frame"]
     try:
-        # 每 20 帧推进一个方向：0 帧对准，4 帧后截图
+        # 每 20 帧推进一个方向：0 帧对准，6 帧后截图。
+        # 注意 tick 回调的第一次调用 f 已经是 1，所以用 (f - 1) 做基准，
+        # 否则「对准第 1 个方向」那一步永远不执行，第一张会在没对准时盲拍。
         if f < 20 * len(DIRECTIONS) + 40:
-            index = f // 20
-            phase = f % 20
+            index = (f - 1) // 20
+            phase = (f - 1) % 20
             if phase == 0 and index != _state["index"] and index < len(DIRECTIONS):
                 _state["index"] = index
                 tag, pitch, yaw = DIRECTIONS[index]

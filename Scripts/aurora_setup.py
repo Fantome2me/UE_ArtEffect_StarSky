@@ -1,4 +1,4 @@
-﻿"""动态星空极光天空 —— 一键落地脚本（UE 5.8 / Python）
+"""动态星空极光天空 —— 一键落地脚本（UE 5.8 / Python）
 
 用 UnrealEditor.exe -ExecutePythonScript="<本文件>" 运行。
 
@@ -283,15 +283,17 @@ def fix_level(material):
             settings = dome.get_editor_property("sky_settings")
             if material:
                 settings.set_editor_property("sky_material", material)
-            settings.set_editor_property("cube_resolution", 512)
-            settings.set_editor_property("update_frequency", 12.0)
+            settings.set_editor_property("cube_resolution", 1024)
+            settings.set_editor_property("update_frequency", 24.0)
+            settings.set_editor_property("offscreen_frequency", 2.0)
+            settings.set_editor_property("use_view_visibility", True)
             settings.set_editor_property("sky_intensity", 1.0)
             dome.set_editor_property("sky_settings", settings)
             dome.set_editor_property("dome_radius_meters", 1000.0)
             dome.set_editor_property("follow_camera", True)
             if hasattr(dome, "update_dome_scale"):
                 dome.update_dome_scale()
-            log("穹顶参数已设置（radius=1000m, cube=512, 12Hz, intensity=1.0）")
+            log("穹顶参数已设置（radius=1000m, cube=1024, 24Hz(可见面)/2Hz(不可见), intensity=1.0）")
         except Exception:
             warn("设置穹顶参数失败: %s" % traceback.format_exc())
 

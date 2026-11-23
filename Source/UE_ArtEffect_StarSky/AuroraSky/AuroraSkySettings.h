@@ -17,7 +17,7 @@ class UMaterialInterface;
  * 想改观感就去改 `Project/Shaders/Private/AuroraSky.usf` 顶部的 #define 与 static const，
  * 改完重启编辑器即可（只需重编着色器，不用重编 C++）。
  *
- * 这里保留的都是**运行时确实需要**的项。
+ * 这里保留的都是**运行时确实需要**的项，重点是画质 / 平滑度的权衡。
  */
 USTRUCT(BlueprintType)
 struct FAuroraSkySettings
@@ -28,13 +28,36 @@ struct FAuroraSkySettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染")
 	TObjectPtr<UMaterialInterface> SkyMaterial = nullptr;
 
-	/** 烘焙用 Cube 单面分辨率。方案 v2 建议 256（PC）；256 时单面 65k texel，接缝不可见。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "32", ClampMax = "1024"))
-	int32 CubeResolution = 256;
+	/**
+	 * 烘焙用 Cube 单面分辨率。
+	 * 1024² 时点状恒星是锐利的圆点；512 已经够用；256 会糊成方块。
+	 * 显存占用 = 面数 × 分辨率² × 8 字节（RGBA16F）：1024 → 约 50 MB。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "32", ClampMax = "2048"))
+	int32 CubeResolution = 1024;
 
-	/** 每秒更新次数。材质 AutoRotate = 0，星云按 Speed = -0.05 缓慢演化，10-15 Hz 足够。 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "1", ClampMax = "120"))
-	float UpdateFrequency = 12.0f;
+	/**
+	 * 可见面的目标刷新率。
+	 * 实际生效值还受帧率约束：子系统每帧最多烘 1 个面，所以
+	 * 「每面实际刷新率 ≈ min(本值, 帧率 / 可见面数)」。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "1", ClampMax = "240"))
+	float UpdateFrequency = 24.0f;
+
+	/**
+	 * 不可见面（视锥之外）的刷新率。
+	 * 这些面只在转视角时才会被看到，低频刷新足够，省下的时间留给可见面。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "0.1", ClampMax = "60"))
+	float OffscreenFrequency = 2.0f;
+
+	/**
+	 * 是否按当前视图判定「哪些面可见」并给它们更高优先级。
+	 * 关掉的话退化成 6 面轮流、均匀刷新。
+	 * （编辑器视口里没有 PlayerController，会自动退化成全部可见。）
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染")
+	bool bUseViewVisibility = true;
 
 	/** 最终天空亮度倍率（材质参数 SkyIntensity），用来和 UE 的曝光/色调映射对齐。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "0.0"))
