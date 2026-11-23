@@ -39,6 +39,18 @@ float SkyTime;
 /** 0 = 完整。诊断用：1 仅星云 / 2 仅星星 / 3 仅极光 / 4 亮度灰度 / 5 仅地平线下雾 */
 #define NTA_DEBUG_MODE      0
 
+/**
+ * 地平线以下那层「地面雾」（带噪声的蓝灰加法，原始 Unity shader 里的 else 分支）。
+ *
+ *   0 = 关闭（当前）：地平线以下只保留极光镜像后的星云与星星，画面是干净的星空
+ *   1 = 打开（原版行为）
+ *
+ * 关掉的原因：这层雾是「加法 + 92% 变暗」双重衰减后的结果，最大贡献只有约 0.017 线性值，
+ * 却会在地平线以下铺一层灰蓝色调，让下半球看起来"发闷"。而本工程的地平线以下
+ * 绝大多数时候被关卡几何挡住，只有从高处往下看越过关卡边缘时才露出来。
+ */
+#define NTA_GROUND_FOG      0
+
 /** 形态最关键参数（0.53 ± 0.1 变化明显） */
 static const float NTA_FORMUPARAM     = 0.53f;
 static const float NTA_STEPSIZE       = 0.1f;
@@ -334,14 +346,16 @@ float3 NTA_SkyColor(float3 rd, float3 ro, float t)
 		return float3(0, 0, 0);
 #endif
 
-		// 下半球：镜像 + 地面雾
+		// 下半球：镜像 + 可选地面雾
 		const float3 rdm = float3(rd.x, abs(rd.y), rd.z);
 		const float4 aur = smoothstep(0.0f, 2.5f, NTA_Aurora(ro, rdm, t));
 		col = col * (1.0f - aur.a * 0.3f) + aur.rgb * 0.3f;
 
+#if NTA_GROUND_FOG
 		const float3 pos = ro + ((0.5f - ro.y) / max(rdm.y, 1.0e-3f)) * rdm;
 		const float nz2 = NTA_TriNoise2d(pos.xz * float2(0.5f, 0.7f), 0.0f, t);
 		col += lerp(float3(0.2f, 0.25f, 0.5f) * 0.08f, float3(0.3f, 0.3f, 0.5f) * 0.7f, nz2 * 0.4f);
+#endif
 	}
 
 #if NTA_DEBUG_MODE == 4
