@@ -412,24 +412,26 @@ void MainCS(uint3 id : SV_DispatchThreadID)
 	const float2 ScaledUVs = ((float2(id.xy) + 0.5f) / float(CubeSize)) * 2.0f - 1.0f;
 
 	// -----------------------------------------------------------------------
-	// ★ 坐标轴换算：UE 是 Z-up，这套 StarNest / 极光数学是 Y-up
+	// ★ 两个坐标约定必须先对齐，否则天空会整体翻转
 	//
-	// 原始 Unity shader 里 rd.y 代表「高度」，所有地平线判断都基于它：
-	//   · rd.y > 0 才走极光正常混合，否则走下半球镜像 + 地面雾
-	//   · NTA_Aurora 末尾有 clamp(rd.y*15 + 0.4, 0, 1) 的「只在地平线以上」闸门
+	// ① 方向取向：材质的 CameraVector 是「像素 -> 相机」（朝内）
+	//    引擎 MaterialTemplate.ush:
+	//        Parameters.CameraVector = -WorldRayDirection();
+	//    而我们是拿它在 cube 上采样的，所以「屏幕视线方向 d」会去读方向 -d 的 texel。
+	//    换句话说：texel v 里必须存 SkyColor(-v)，否则天空被点对称翻转（上下 + 左右同时翻）。
+	//    这就是之前「天空上下颠倒」的原因 —— 这里取负号修掉。
 	//
-	// 之前把 UE 世界方向原样喂进去，导致 rd.y 其实是「世界 Y 轴（右）」，
-	// 于是那条地平线判断切的是一个穿过 Y 轴的竖直平面 —— 天空里多出一堵墙，
-	// 在 yaw = 0 的机位上正好投影成画面正中的一条硬边。
-	//
-	// 换算 (X, Y, Z)_UE -> (X, Z, -Y)：
-	//   · UE 的 +Z（上）  -> shader 的 +Y（上）      ✅ 高度轴对上
-	//   · 变换矩阵行列式 = +1，是纯旋转、不镜像       ✅ 星云不会被镜像
+	// ② 上方向轴：原始 StarNest / 极光数学是 Y-up（rd.y = 高度），
+	//    而 UE 世界是 X 前 / Y 右 / Z 上。不做换算的话 rd.y 实际是「世界 Y 轴（水平）」，
+	//    if (rd.y > 0) 切出来的不是地平线，而是一个穿过 Y 轴的竖直平面
+	//    （yaw = 0 时正好投影成画面正中的一条硬边）。
+	//    换算 (X, Y, Z)_UE -> (X, Z, -Y)：UE 的 +Z(上) 落到 shader 的 +Y(上)；
+	//    行列式 = +1，是纯旋转，不会镜像星云。
 	//
 	// 注意 NTA_RAY_ORIGIN 保持在 shader 的 Y-up 空间里不动（原 shader 就是 (0,0,-6.7)）。
 	// -----------------------------------------------------------------------
-	const float3 rdWorld = normalize(NTA_CubeFaceDirection(ScaledUVs, (int)id.z));
-	const float3 rd = float3(rdWorld.x, rdWorld.z, -rdWorld.y);
+	const float3 rdView = -normalize(NTA_CubeFaceDirection(ScaledUVs, (int)id.z));
+	const float3 rd = float3(rdView.x, rdView.z, -rdView.y);
 
 	float3 col = NTA_SkyColor(rd, NTA_RAY_ORIGIN, SkyTime);
 
