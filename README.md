@@ -49,6 +49,19 @@ UAuroraSkySubsystem (12 Hz 节流)
 
 ---
 
+## 关于模板角色资源（未入库）
+
+`Content/Characters/Mannequins` 是 **UE5「Third Person」模板自带**的 Manny/Quinn 角色资产
+（约 88 MB，含骨骼、网格、贴图、动画），**不属于本项目的成果，因此没有上传**，并已加入 `.gitignore`。
+
+clone 下来后如果角色不显示，用同版本引擎（UE 5.8）新建一个「Third Person」模板工程，
+把它 `Content/Characters/Mannequins` 整个目录拷到本工程的 `Content/Characters/` 下即可。
+
+> 星空本身的全部内容都完整在库：C++ 模块、`AuroraSky.usf`、关卡与天空材质、
+> 世界分区 actor、脚本与文档。
+
+---
+
 ## 实现说明
 
 详细文档：**[星空极光天空_实现说明.md](Docs/%E6%98%9F%E7%A9%BA%E6%9E%81%E5%85%89%E5%A4%A9%E7%A9%BA_%E5%AE%9E%E7%8E%B0%E8%AF%B4%E6%98%8E.md)**
