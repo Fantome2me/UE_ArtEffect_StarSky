@@ -1,0 +1,408 @@
+﻿// Copyright (c) 2026. Star Sky / Aurora / Nebula sky for UE.
+//
+// 逐行直译自 Unity 版 Assets/StarNestSkybox.shader（内部名 Skybox/AuroraStarNest）。
+// 参数与颜色以 **方案文档 v2 的「材质实际」值** 为准（不是 shader 默认值）。
+//
+// 入口：MainCS —— 一个 thread 计算一个 texel。
+// cube 以 Texture2DArray 方式绑定 UAV（6 个 slice = 6 个面），一次 dispatch 覆盖全部 6 面，
+// dispatch 的 Z 维 = face index。
+//
+// ---------------------------------------------------------------------------
+// 性能约定：**所有天空参数都是编译期常量**，运行时只有 3 个 uniform：
+//   RWOutput (UAV) / CubeSize / SkyTime
+// 这样循环上界是字面量（可被编译器优化/SIMD 化），颜色与系数被折成立即数，
+// 且 AutoRotate = 0 让两处旋转矩阵的 cos/sin 在编译期算完。
+// 要改画面观感就改下面的 #define / static const —— 它们和文档 §3.1、§3.2 一一对应。
+// ---------------------------------------------------------------------------
+
+#include "/Engine/Private/Common.ush"
+
+// ===========================================================================
+// 运行时 uniform（只有这 3 个）
+// ===========================================================================
+RWTexture2DArray<float4> RWOutput;
+
+uint  CubeSize;
+float SkyTime;
+
+// ===========================================================================
+// 编译期常量 —— 方案 v2 §3.1 数值参数表
+// ===========================================================================
+
+/** 体积步进（材质实际 28.46 → int 截断 28）。星云主要成本。 */
+#define NTA_VOLSTEPS        28
+/** 分形迭代（材质实际 16.3 → int 截断 16）。 */
+#define NTA_ITERATIONS      16
+/** 极光层数（v2 附录 A.1 仍是 50）。 */
+#define NTA_AURORA_LAYERS   50
+
+/** 0 = 完整。诊断用：1 仅星云 / 2 仅星星 / 3 仅极光 / 4 亮度灰度 / 5 仅地平线下雾 */
+#define NTA_DEBUG_MODE      0
+
+/** 形态最关键参数（0.53 ± 0.1 变化明显） */
+static const float NTA_FORMUPARAM     = 0.53f;
+static const float NTA_STEPSIZE       = 0.1f;
+/** ★ v2 关键修正：材质实际是 15.2，不是 0.8（构图完全不同） */
+static const float NTA_ZOOM           = 15.2f;
+/** 瓷砖折叠尺度 */
+static const float NTA_TILE           = 0.75f;
+/** ★ v2：负值 —— 反向演化 */
+static const float NTA_SPEED          = -0.05f;
+static const float NTA_BRIGHTNESS     = 0.0015f;
+/** 暗物质（遮挡对比），材质实际 0.43 */
+static const float NTA_DARKMATTER     = 0.43f;
+static const float NTA_DISTFADING     = 0.7f;
+static const float NTA_SATURATION     = 0.85f;
+
+/** ★ v2：AutoRotate = 0 —— 整体不自转，构图固定 */
+static const float NTA_A1 = 0.5f;   // = 0.5 + AutoRotate * t * 0.1，AutoRotate = 0
+static const float NTA_A2 = 0.8f;   // = 0.8 + AutoRotate * t * 0.05
+
+/** 极光速度总控（材质 _TimeScale = 0.735），内部 ×25 */
+static const float NTA_AURORA_TIME_SCALE = 0.735f;
+static const float NTA_AURORA_EXPOSURE   = 1.175f;
+static const float NTA_AURORA_HEIGHT     = 0.823f;
+
+static const float NTA_STAR_INTENSITY = 2.0f;
+
+/** ★★★★★ v2 最重要的一条：92% 变暗 —— 最终亮度只有计算值的 8% */
+static const float NTA_SKY_DARKEN = 0.92f;
+static const float3 NTA_SKY_DARKEN_COLOR = float3(0.0f, 0.0f, 0.0f);
+
+/** 原 shader 里写死的 ro，决定星云视角与极光层求交位置 */
+static const float3 NTA_RAY_ORIGIN = float3(0.0f, 0.0f, -6.7f);
+
+// 颜色：方案 v2 §3.2 的 **Linear 列**（UE 的向量参数是线性，直接填 sRGB 会偏亮偏粉）
+static const float3 NTA_AURORA_COLOR1   = float3(0.158f, 0.000f, 0.078f);   // sRGB(0.434,0,0.309) 暗紫红
+static const float3 NTA_AURORA_COLOR2   = float3(1.000f, 0.317f, 0.746f);   // sRGB(1,0.599,0.879) 粉紫
+static const float3 NTA_NEBULA_COLOR    = float3(1.000f, 0.033f, 0.748f);   // sRGB(1,0.2,0.88)   品红
+static const float3 NTA_HIGHLIGHT_COLOR = float3(0.494f, 0.962f, 1.000f);   // sRGB(0.731,0.983,1) 青白
+static const float3 NTA_DARK_COLOR      = float3(0.096f, 0.007f, 0.323f);   // sRGB(0.343,0.077,0.604) 深紫暗底
+
+// ---------------------------------------------------------------------------
+// 极大值保护：原 shader 在 rd.y 接近 0 时 pt 会数值爆炸（风险 R13）
+// ---------------------------------------------------------------------------
+#define NTA_EPS 1e-4f
+
+// ===========================================================================
+// 极光工具函数
+// ===========================================================================
+
+float2x2 NTA_MM2(float a)
+{
+	float c = cos(a), s = sin(a);
+	return float2x2(c, s, -s, c);
+}
+
+// 原 shader 里的 m2 是常量矩阵
+static const float2x2 NTA_M2 = float2x2(0.95534f, 0.29552f, -0.29552f, 0.95534f);
+
+float NTA_Tri(float x)
+{
+	return clamp(abs(frac(x) - 0.5f), 0.01f, 0.49f);
+}
+
+float2 NTA_Tri2(float2 p)
+{
+	return float2(NTA_Tri(p.x) + NTA_Tri(p.y), NTA_Tri(p.y + NTA_Tri(p.x)));
+}
+
+float NTA_Hash21(float2 n)
+{
+	return frac(sin(dot(n, float2(12.9898f, 4.1414f))) * 43758.5453f);
+}
+
+// 磁砖化三角波噪声，5 次迭代，每次用 mm2(time*spd) 旋转 —— 极光会缓慢扭动
+float NTA_TriNoise2d(float2 p, float spd, float t)
+{
+	// 材质 _TimeScale = 0.735，内部 ×25
+	const float time = t * (NTA_AURORA_TIME_SCALE * 25.0f);
+
+	float z = 1.8f;
+	float z2 = 2.5f;
+	float rz = 0.0f;
+
+	p = mul(NTA_MM2(p.x * 0.06f), p);
+	float2 bp = p;
+
+	// 5 次固定迭代 —— 展开，避免循环开销
+	[unroll]
+	for (int i = 0; i < 5; i++)
+	{
+		float2 dg = NTA_Tri2(bp * 1.85f) * 0.75f;
+		dg = mul(NTA_MM2(time * spd), dg);
+		p -= dg / z2;
+
+		bp *= 1.3f;
+		z2 *= 0.45f;
+		z *= 0.42f;
+
+		p *= 1.21f + (rz - 1.0f) * 0.02f;
+		rz += NTA_Tri(p.x + NTA_Tri(p.y)) * z;
+		p = mul(-NTA_M2, p);
+	}
+
+	return clamp(1.0f / pow(rz * 29.0f, 1.3f), 0.0f, 0.55f);
+}
+
+// 50 层带状噪声，越往后越高
+float4 NTA_Aurora(float3 ro, float3 rd, float t)
+{
+	float4 col = float4(0, 0, 0, 0);
+	float4 avgCol = float4(0, 0, 0, 0);
+
+	// 防止 rd.y 接近 0 时除零（原 shader 用 rd.y*2+0.4 部分掩盖了这点）
+	const float denomRaw = rd.y * 2.0f + 0.4f;
+	const float denom = (abs(denomRaw) < NTA_EPS)
+		? (denomRaw >= 0.0f ? NTA_EPS : -NTA_EPS)
+		: denomRaw;
+
+	[loop]
+	for (int i = 0; i < NTA_AURORA_LAYERS; i++)
+	{
+		const float fi = (float)i;
+
+		const float of = 0.006f * NTA_Hash21(float2(fi, fi * 2.0f)) * smoothstep(0.0f, 15.0f, fi);
+		float pt = ((NTA_AURORA_HEIGHT + pow(fi, 1.4f) * 0.002f) - ro.y) / denom;
+		pt -= of;
+
+		const float3 bpos = ro + pt * rd;
+		const float rzt = NTA_TriNoise2d(bpos.xz, 0.06f, t);
+
+		const float k = sin(fi * 0.05f) * 0.5f + 0.5f;
+		const float3 aurColor = lerp(NTA_AURORA_COLOR1, NTA_AURORA_COLOR2, k);
+		const float4 col2 = float4(aurColor * rzt, rzt);
+
+		avgCol = lerp(avgCol, col2, 0.5f);
+		col += avgCol * exp2(-fi * 0.065f - 2.5f) * smoothstep(0.0f, 5.0f, fi);
+	}
+
+	col *= clamp(rd.y * 15.0f + 0.4f, 0.0f, 1.0f);
+	return col * NTA_AURORA_EXPOSURE;
+}
+
+// ===========================================================================
+// 星云核心 + 星星
+// ===========================================================================
+
+float3 NTA_NmzHash33(float3 q)
+{
+	uint3 p = uint3(int3(q));
+	p = p * uint3(374761393u, 1103515245u, 668265263u) + p.zxy + p.yzx;
+	p = p.yzx * (p.zxy ^ (p >> 3u));
+	return float3(p ^ (p >> 16u)) * (1.0f / float(0xffffffffu));
+}
+
+// 点状恒星球面分布
+float3 NTA_Stars(float3 p)
+{
+	float3 c = float3(0, 0, 0);
+	const float res = 1024.0f;
+
+	[unroll]
+	for (int i = 0; i < 4; i++)
+	{
+		const float3 q  = frac(p * (0.15f * res)) - 0.5f;
+		const float3 id = floor(p * (0.15f * res));
+		const float2 rn = NTA_NmzHash33(id).xy;
+
+		float c2 = 1.0f - smoothstep(0.0f, 0.6f, length(q));
+		c2 *= step(rn.x, 0.0005f + (float)i * (float)i * 0.001f);
+		c += c2 * (lerp(float3(1.0f, 0.49f, 0.1f), float3(0.75f, 0.9f, 1.0f), rn.y) * 0.1f + 0.9f);
+
+		p *= 1.3f;
+	}
+
+	return c * c * 0.8f * NTA_STAR_INTENSITY;
+}
+
+// 体积步进 + 分形折叠（Kali 的 Star Nest）
+float3 NTA_RenderStarNest(float3 dir, float t)
+{
+	dir *= NTA_ZOOM;
+
+	const float time = t * NTA_SPEED * 0.5f + 0.25f;
+
+	// AutoRotate = 0 → a1 / a2 是编译期常量，cos/sin 在编译期折成立即数
+	const float c1 = cos(NTA_A1), s1 = sin(NTA_A1);
+	const float c2 = cos(NTA_A2), s2 = sin(NTA_A2);
+
+	float tx;
+	tx = dir.x * c1 - dir.z * s1; dir.z = dir.x * s1 + dir.z * c1; dir.x = tx;
+	tx = dir.x * c2 - dir.y * s2; dir.y = dir.x * s2 + dir.y * c2; dir.x = tx;
+
+	float3 from = float3(1.0f, 0.5f, 0.5f) + float3(time * 2.0f, time, -2.0f);
+	tx = from.x * c1 - from.z * s1; from.z = from.x * s1 + from.z * c1; from.x = tx;
+	tx = from.x * c2 - from.y * s2; from.y = from.x * s2 + from.y * c2; from.x = tx;
+
+	float s = 0.1f;
+	float fade = 1.0f;
+	float3 v = float3(0, 0, 0);
+
+	const float3 tt = NTA_TILE.xxx;
+	const float3 tt2 = tt * 2.0f;
+
+	[loop]
+	for (int r = 0; r < NTA_VOLSTEPS; r++)
+	{
+		float3 p = from + s * dir * 0.5f;
+
+		// 无限重复的「瓷砖」折叠（用显式 floor 代替 fmod，见风险 R8）
+		p = abs(tt - (p - tt2 * floor(p / tt2)));
+
+		float pa = 0.0f;
+		float a = 0.0f;
+
+		// 16 次固定迭代 —— 展开
+		[unroll]
+		for (int j = 0; j < NTA_ITERATIONS; j++)
+		{
+			// 反演折叠 —— StarNest 形态的根本来源
+			// max(dot,eps)：原 shader 在 dot 趋零时 p 会爆到 inf，
+			// 而 cube RT 是 RGBA16F，inf/NaN 会被写进贴图，在材质里变成彩色方块噪点
+			p = abs(p) / max(dot(p, p), 1.0e-6f) - NTA_FORMUPARAM;
+			a += abs(length(p) - pa);
+			pa = length(p);
+		}
+
+		// 密度封顶，避免 a*a*a 溢出
+		a = min(a, 1.0e4f);
+
+		const float dm = saturate(NTA_DARKMATTER - a * a * 0.001f);
+		a = a * a * a;
+		if (r > 6)
+		{
+			fade *= 1.0f - dm;
+		}
+
+		v += fade;
+
+		const float3 cp = float3(s, s * s, s * s * s * s);
+		float3 nc = NTA_DARK_COLOR;
+		nc = lerp(nc, NTA_NEBULA_COLOR, cp.y);
+		nc = lerp(nc, NTA_HIGHLIGHT_COLOR, cp.z);
+		v += nc * a * NTA_BRIGHTNESS * fade;
+
+		fade *= NTA_DISTFADING;
+		s += NTA_STEPSIZE;
+	}
+
+	v = lerp(length(v).xxx, v, NTA_SATURATION);
+	return v * 0.01f;
+}
+
+// ===========================================================================
+// 主函数
+// ===========================================================================
+
+float3 NTA_SkyColor(float3 rd, float3 ro, float t)
+{
+	const float fadeBelow = smoothstep(0.0f, 0.01f, abs(rd.y)) * 0.1f + 0.9f;
+
+	float3 col = NTA_RenderStarNest(rd, t);
+
+#if NTA_DEBUG_MODE == 1
+	return col;
+#endif
+
+	const float3 starCol = NTA_Stars(rd);
+
+#if NTA_DEBUG_MODE == 2
+	return starCol;
+#endif
+
+	col += starCol;
+
+#if NTA_DEBUG_MODE == 5
+	col = float3(0, 0, 0);
+#endif
+
+	// 极光只在地平线以上出现
+	if (rd.y > 0.0f)
+	{
+		const float4 aur = smoothstep(0.0f, 1.5f, NTA_Aurora(ro, rd, t)) * fadeBelow;
+
+#if NTA_DEBUG_MODE == 3
+		return aur.rgb;
+#endif
+
+		col = col * (1.0f - aur.a) + aur.rgb;
+	}
+	else
+	{
+#if NTA_DEBUG_MODE == 3
+		return float3(0, 0, 0);
+#endif
+
+		// 下半球：镜像 + 地面雾
+		const float3 rdm = float3(rd.x, abs(rd.y), rd.z);
+		const float4 aur = smoothstep(0.0f, 2.5f, NTA_Aurora(ro, rdm, t));
+		col = col * (1.0f - aur.a * 0.3f) + aur.rgb * 0.3f;
+
+		const float3 pos = ro + ((0.5f - ro.y) / max(rdm.y, 1.0e-3f)) * rdm;
+		const float nz2 = NTA_TriNoise2d(pos.xz * float2(0.5f, 0.7f), 0.0f, t);
+		col += lerp(float3(0.2f, 0.25f, 0.5f) * 0.08f, float3(0.3f, 0.3f, 0.5f) * 0.7f, nz2 * 0.4f);
+	}
+
+#if NTA_DEBUG_MODE == 4
+	return length(col).xxx;
+#endif
+
+	// ★ 92% 变暗 —— 决定观感，别漏（风险 R1）
+	col = lerp(col, NTA_SKY_DARKEN_COLOR, NTA_SKY_DARKEN);
+
+	return col;
+}
+
+// cube face (0..5) + [-1,1] UV -> 方向，采用引擎同款约定（与 ReflectionEnvironmentShaders.usf 一致）
+float3 NTA_CubeFaceDirection(float2 ScaledUVs, int InCubeFace)
+{
+	float3 CubeCoordinates;
+
+	if (InCubeFace == 0)		// +X
+	{
+		CubeCoordinates = float3(1.0f, -ScaledUVs.y, -ScaledUVs.x);
+	}
+	else if (InCubeFace == 1)	// -X
+	{
+		CubeCoordinates = float3(-1.0f, -ScaledUVs.y, ScaledUVs.x);
+	}
+	else if (InCubeFace == 2)	// +Y
+	{
+		CubeCoordinates = float3(ScaledUVs.x, 1.0f, ScaledUVs.y);
+	}
+	else if (InCubeFace == 3)	// -Y
+	{
+		CubeCoordinates = float3(ScaledUVs.x, -1.0f, -ScaledUVs.y);
+	}
+	else if (InCubeFace == 4)	// +Z
+	{
+		CubeCoordinates = float3(ScaledUVs.x, -ScaledUVs.y, 1.0f);
+	}
+	else						// -Z
+	{
+		CubeCoordinates = float3(-ScaledUVs.x, -ScaledUVs.y, -1.0f);
+	}
+
+	return CubeCoordinates;
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= CubeSize || id.y >= CubeSize || id.z >= 6)
+	{
+		return;
+	}
+
+	const float2 ScaledUVs = ((float2(id.xy) + 0.5f) / float(CubeSize)) * 2.0f - 1.0f;
+	const float3 rd = normalize(NTA_CubeFaceDirection(ScaledUVs, (int)id.z));
+
+	float3 col = NTA_SkyColor(rd, NTA_RAY_ORIGIN, SkyTime);
+
+	// 兜底：写进 RGBA16F 之前把 inf/NaN 挡掉（否则材质里就是彩色方块噪点）
+	col = clamp(col, 0.0f, 8.0f);
+	col = all(col == col) ? col : float3(0, 0, 0);
+
+	RWOutput[uint3(id.x, id.y, id.z)] = float4(col, 1.0f);
+}
