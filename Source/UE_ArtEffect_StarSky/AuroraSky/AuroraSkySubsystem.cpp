@@ -4,10 +4,8 @@
 
 #include "AuroraSky/AuroraSkyDome.h"
 #include "AuroraSky/AuroraSkyShaderDispatch.h"
-#include "Camera/PlayerCameraManager.h"
 #include "Engine/TextureRenderTargetCube.h"
 #include "EngineUtils.h"
-#include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "RHI.h"
 #include "RenderingThread.h"
@@ -19,27 +17,6 @@ namespace
 	/** Cube 分辨率硬上限，避免把 Details 面板里的值调到显存爆掉 */
 	constexpr int32 GSkyCubeResolutionMax = 2048;
 	constexpr int32 GSkyCubeResolutionMin = 32;
-
-	/** 6 个 cube 面全可见 */
-	constexpr int32 GAllFacesMask = (1 << 6) - 1;
-
-	/** 按引擎 cube 面顺序（+X,-X,+Y,-Y,+Z,-Z）返回方向的主轴面号 */
-	int32 DominantCubeFace(const FVector& Dir)
-	{
-		const double Ax = FMath::Abs(Dir.X);
-		const double Ay = FMath::Abs(Dir.Y);
-		const double Az = FMath::Abs(Dir.Z);
-
-		if (Ax >= Ay && Ax >= Az)
-		{
-			return Dir.X > 0.0 ? 0 : 1;
-		}
-		if (Ay >= Az)
-		{
-			return Dir.Y > 0.0 ? 2 : 3;
-		}
-		return Dir.Z > 0.0 ? 4 : 5;
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +35,7 @@ void UAuroraSkySubsystem::Deinitialize()
 	ReleaseRenderTarget();
 	CachedDome = nullptr;
 	LastBoundTexture.Reset();
+	LastBoundMID.Reset();
 
 	Super::Deinitialize();
 }
@@ -89,10 +67,7 @@ void UAuroraSkySubsystem::Tick(float DeltaTime)
 
 	const FAuroraSkySettings Settings = GetActiveSettings();
 
-	// 天空演化时间与调度时钟相互独立：前者可被 SkyTimeScale 缩放/暂停，
-	// 后者始终按真实时间推进，保证调度节奏稳定
 	SkyTime += DeltaTime * Settings.SkyTimeScale;
-	ScheduleClock += DeltaTime;
 
 	EnsureRenderTarget(Settings.CubeResolution);
 	if (!SkyCubeRT)
@@ -100,31 +75,19 @@ void UAuroraSkySubsystem::Tick(float DeltaTime)
 		return;
 	}
 
-	// MID / 贴图参数每帧对齐一次（贴图只在 RT 或 MID 变化时重设）
 	BindCubeToDome(Settings);
 
-	// RT 刚建好（或刚重建）：先把 6 个面一次性填满，
-	// 否则按面调度要等 6 帧才补全，开头会出现黑天空
-	if (bNeedsFullBake)
-	{
-		bNeedsFullBake = false;
-		DispatchFaces(0, 6, SkyTime + Settings.SkyTimeOffset);
-		for (int32 Face = 0; Face < 6; ++Face)
-		{
-			FaceLastUpdateTime[Face] = ScheduleClock;
-		}
-		return;
-	}
-
-	// 每帧最多烘 1 个面 → 单帧 GPU 峰值恒定且很小
-	const int32 Face = SelectNextFace(Settings);
-	if (Face == INDEX_NONE)
+	// 节流：按 UpdateFrequency 决定这一帧要不要烘
+	TimeUntilNextBake -= DeltaTime;
+	if (!bNeedsBake && TimeUntilNextBake > 0.0f)
 	{
 		return;
 	}
 
-	DispatchFaces(Face, 1, SkyTime + Settings.SkyTimeOffset);
-	FaceLastUpdateTime[Face] = ScheduleClock;
+	bNeedsBake = false;
+	TimeUntilNextBake = 1.0f / FMath::Max(Settings.UpdateFrequency, 0.1f);
+
+	DispatchBake(SkyTime + Settings.SkyTimeOffset);
 }
 
 // ---------------------------------------------------------------------------
@@ -164,19 +127,10 @@ void UAuroraSkySubsystem::BakeNow()
 	}
 
 	BindCubeToDome(Settings);
+	DispatchBake(SkyTime + Settings.SkyTimeOffset);
 
-	// 一次性把 6 个面全烘一遍（会花掉完整成本，仅调试/落地脚本使用）
-	DispatchFaces(0, 6, SkyTime + Settings.SkyTimeOffset);
-
-	for (int32 Face = 0; Face < 6; ++Face)
-	{
-		FaceLastUpdateTime[Face] = ScheduleClock;
-	}
-}
-
-int32 UAuroraSkySubsystem::GetVisibleFaceMask() const
-{
-	return ResolveVisibleFaceMask(GetActiveSettings());
+	bNeedsBake = false;
+	TimeUntilNextBake = 1.0f / FMath::Max(Settings.UpdateFrequency, 0.1f);
 }
 
 // ---------------------------------------------------------------------------
@@ -228,75 +182,6 @@ FAuroraSkySettings UAuroraSkySubsystem::GetActiveSettings() const
 	return FAuroraSkySettings();
 }
 
-int32 UAuroraSkySubsystem::ResolveVisibleFaceMask(const FAuroraSkySettings& Settings) const
-{
-	if (!Settings.bUseViewVisibility)
-	{
-		return GAllFacesMask;
-	}
-
-	// 编辑器视口没有 PlayerController，会自动退化成「全部可见」
-	const UWorld* World = GetWorld();
-	const APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
-	const APlayerCameraManager* Cam = PC ? PC->PlayerCameraManager : nullptr;
-	if (!Cam)
-	{
-		return GAllFacesMask;
-	}
-
-	const FRotator CamRot = Cam->GetCameraRotation();
-	const FRotationMatrix Basis(CamRot);
-	const FVector Fwd = Basis.GetUnitAxis(EAxis::X);
-	const FVector Right = Basis.GetUnitAxis(EAxis::Y);
-	const FVector Up = Basis.GetUnitAxis(EAxis::Z);
-
-	const float HalfFovX = FMath::DegreesToRadians(FMath::Clamp(Cam->GetFOVAngle(), 10.0f, 170.0f) * 0.5f);
-	const float TanX = FMath::Tan(HalfFovX);
-	// 竖直方向按 16:9 估一下即可 —— 这里只用来决定「哪几个面优先」，不需要精确
-	const float TanY = TanX * 9.0f / 16.0f;
-
-	const FVector Corners[4] =
-	{
-		(Fwd + Right * TanX + Up * TanY).GetSafeNormal(),
-		(Fwd - Right * TanX + Up * TanY).GetSafeNormal(),
-		(Fwd + Right * TanX - Up * TanY).GetSafeNormal(),
-		(Fwd - Right * TanX - Up * TanY).GetSafeNormal()
-	};
-
-	int32 Mask = 1 << DominantCubeFace(Fwd);
-	for (const FVector& Corner : Corners)
-	{
-		Mask |= 1 << DominantCubeFace(Corner);
-	}
-	return Mask;
-}
-
-int32 UAuroraSkySubsystem::SelectNextFace(const FAuroraSkySettings& Settings) const
-{
-	const int32 VisibleMask = ResolveVisibleFaceMask(Settings);
-
-	const float VisibleInterval = 1.0f / FMath::Max(Settings.UpdateFrequency, 0.1f);
-	const float OffscreenInterval = 1.0f / FMath::Max(Settings.OffscreenFrequency, 0.1f);
-
-	int32 BestFace = INDEX_NONE;
-	float BestOverdue = 0.0f;
-
-	for (int32 Face = 0; Face < 6; ++Face)
-	{
-		const bool bVisible = (VisibleMask & (1 << Face)) != 0;
-		const float Interval = bVisible ? VisibleInterval : OffscreenInterval;
-		const float Overdue = (ScheduleClock - FaceLastUpdateTime[Face]) - Interval;
-
-		if (Overdue > BestOverdue)
-		{
-			BestOverdue = Overdue;
-			BestFace = Face;
-		}
-	}
-
-	return BestFace;
-}
-
 void UAuroraSkySubsystem::ReleaseRenderTarget()
 {
 	if (SkyCubeRT)
@@ -308,12 +193,7 @@ void UAuroraSkySubsystem::ReleaseRenderTarget()
 	LastBoundTexture.Reset();
 	LastBoundMID.Reset();
 	bLoggedNotReady = false;
-	bNeedsFullBake = true;
-
-	for (int32 Face = 0; Face < 6; ++Face)
-	{
-		FaceLastUpdateTime[Face] = -1000.0f;
-	}
+	bNeedsBake = true;
 }
 
 void UAuroraSkySubsystem::EnsureRenderTarget(int32 Resolution)
@@ -384,7 +264,7 @@ void UAuroraSkySubsystem::BindCubeToDome(const FAuroraSkySettings& Settings)
 	}
 }
 
-void UAuroraSkySubsystem::DispatchFaces(int32 FirstFace, int32 NumFaces, float InSkyTime)
+void UAuroraSkySubsystem::DispatchBake(float InSkyTime)
 {
 	if (!SkyCubeRT)
 	{
@@ -408,7 +288,7 @@ void UAuroraSkySubsystem::DispatchFaces(int32 FirstFace, int32 NumFaces, float I
 
 	// 资源解引用和 dispatch 都放在渲染线程做
 	ENQUEUE_RENDER_COMMAND(AuroraSkyBake)(
-		[RTResource, Size, FirstFace, NumFaces, InSkyTime](FRHICommandListImmediate& RHICmdList)
+		[RTResource, Size, InSkyTime](FRHICommandListImmediate& RHICmdList)
 		{
 			FTextureRenderTargetCubeResource* CubeResource = RTResource->GetTextureRenderTargetCubeResource();
 			if (!CubeResource)
@@ -428,8 +308,6 @@ void UAuroraSkySubsystem::DispatchFaces(int32 FirstFace, int32 NumFaces, float I
 				CubeTexture.GetReference(),
 				CubeUAV.GetReference(),
 				Size,
-				FirstFace,
-				NumFaces,
 				InSkyTime);
 		});
 }

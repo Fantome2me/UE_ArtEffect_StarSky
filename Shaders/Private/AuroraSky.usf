@@ -18,13 +18,11 @@
 #include "/Engine/Private/Common.ush"
 
 // ===========================================================================
-// 运行时 uniform（只有这 4 个）
+// 运行时 uniform（只有这 3 个）
 // ===========================================================================
 RWTexture2DArray<float4> RWOutput;
 
 uint  CubeSize;
-/** 本次 dispatch 从第几个面开始（按面调度用：一次只烘 1~N 个面） */
-uint  CubeFaceBase;
 float SkyTime;
 
 // ===========================================================================
@@ -478,8 +476,8 @@ float3 NTA_CubeFaceDirection(float2 ScaledUVs, int InCubeFace)
 [numthreads(8, 8, 1)]
 void MainCS(uint3 id : SV_DispatchThreadID)
 {
-	// 按面调度：本次 dispatch 只覆盖 CubeFaceBase .. CubeFaceBase + N - 1 这几个面
-	const uint faceIndex = id.z + CubeFaceBase;
+	// 一次 dispatch 覆盖全部 6 个面：DispatchThreadID.z 就是面号
+	const uint faceIndex = id.z;
 	if (id.x >= CubeSize || id.y >= CubeSize || faceIndex >= 6)
 	{
 		return;

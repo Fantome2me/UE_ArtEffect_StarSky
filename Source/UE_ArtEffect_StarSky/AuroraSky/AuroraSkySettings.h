@@ -37,27 +37,13 @@ struct FAuroraSkySettings
 	int32 CubeResolution = 1024;
 
 	/**
-	 * 可见面的目标刷新率。
-	 * 实际生效值还受帧率约束：子系统每帧最多烘 1 个面，所以
-	 * 「每面实际刷新率 ≈ min(本值, 帧率 / 可见面数)」。
+	 * 烘焙频率（Hz）。
+	 * 每次烘焙 = 一次 dispatch 算完全部 6 个面。
+	 * 注意成本随分辨率呈平方增长：1024² × 6 × 15 Hz 已经不轻，
+	 * 想降开销优先调这里或降分辨率。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "1", ClampMax = "240"))
-	float UpdateFrequency = 24.0f;
-
-	/**
-	 * 不可见面（视锥之外）的刷新率。
-	 * 这些面只在转视角时才会被看到，低频刷新足够，省下的时间留给可见面。
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "0.1", ClampMax = "60"))
-	float OffscreenFrequency = 2.0f;
-
-	/**
-	 * 是否按当前视图判定「哪些面可见」并给它们更高优先级。
-	 * 关掉的话退化成 6 面轮流、均匀刷新。
-	 * （编辑器视口里没有 PlayerController，会自动退化成全部可见。）
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染")
-	bool bUseViewVisibility = true;
+	float UpdateFrequency = 15.0f;
 
 	/** 最终天空亮度倍率（材质参数 SkyIntensity），用来和 UE 的曝光/色调映射对齐。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "渲染", meta = (ClampMin = "0.0"))

@@ -16,7 +16,7 @@ class AAuroraSkyDome;
  *
  *   SkyTime
  *        ↓
- *   FAuroraSkyCS  (cube，**按面 dispatch**；所有天空参数是编译期常量)
+ *   FAuroraSkyCS  (cube；所有天空参数是编译期常量)
  *        ↓
  *   UTextureRenderTargetCube (PF_FloatRGBA, 带 UAV)
  *        ↓
@@ -24,17 +24,10 @@ class AAuroraSkyDome;
  *        ↓
  *   穹顶球体 + SkyLight Real Time Capture
  *
- * ## 按面调度（帧率平滑的关键）
+ * 烘焙节奏：按 `UpdateFrequency` 节流，每次烘焙用**一次 dispatch 算完全部 6 个面**。
+ * 成本是 `分辨率² × 6 × 频率`，所以在 1024 / 24 Hz 下开销不小 —— 要降就降这两项。
  *
- * 原先每次烘焙都是「6 个面一次 dispatch」，单帧会出现一个很大的突刺。
- * 现在改成**每帧最多烘 1 个面**，从「最该刷新」的面里挑：
- *   · 视锥内的可见面 → 目标 `UpdateFrequency`（默认 24 Hz）
- *   · 视锥外的面     → `OffscreenFrequency`（默认 2 Hz）
- * 于是单帧 GPU 峰值降到原来的 1/6，而玩家真正看得到的那几个面仍然刷得很勤。
- * 实际每面刷新率 ≈ min(UpdateFrequency, 帧率 / 可见面数)。
- *
- * 在编辑器世界里也会 tick（IsTickableInEditor），不打 PIE 也能看到动态星空；
- * 但编辑器没有 PlayerController，可见性判定会退化成「6 面全部可见」。
+ * 在编辑器世界里也会 tick（IsTickableInEditor），不打 PIE 也能看到动态星空。
  */
 UCLASS()
 class UAuroraSkySubsystem : public UTickableWorldSubsystem
@@ -61,7 +54,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AuroraSky")
 	bool IsSkyEnabled() const { return bSkyEnabled; }
 
-	/** 立刻把 6 个面全部重算一遍（调试 / 落地脚本用，会一次性花掉完整成本） */
+	/** 立刻烘焙一次（不等节流） */
 	UFUNCTION(BlueprintCallable, Category = "AuroraSky")
 	void BakeNow();
 
@@ -78,10 +71,6 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AuroraSky")
 	float GetSkyTime() const { return SkyTime; }
 
-	/** 当前这一帧判定为「视锥内」的 cube 面位掩码（bit 0..5 = +X,-X,+Y,-Y,+Z,-Z） */
-	UFUNCTION(BlueprintCallable, Category = "AuroraSky")
-	int32 GetVisibleFaceMask() const;
-
 	static UAuroraSkySubsystem* Get(const UWorld* World);
 
 private:
@@ -90,13 +79,7 @@ private:
 	void EnsureRenderTarget(int32 Resolution);
 	void ReleaseRenderTarget();
 	void BindCubeToDome(const FAuroraSkySettings& Settings);
-	void DispatchFaces(int32 FirstFace, int32 NumFaces, float InSkyTime);
-
-	/** 选出本帧最该刷新的那个面；返回 INDEX_NONE 表示这帧不需要烘 */
-	int32 SelectNextFace(const FAuroraSkySettings& Settings) const;
-
-	/** 当前视图覆盖了哪几个 cube 面（6 bit 掩码）。没有相机时返回全部可见。 */
-	int32 ResolveVisibleFaceMask(const FAuroraSkySettings& Settings) const;
+	void DispatchBake(float InSkyTime);
 
 	UPROPERTY(Transient)
 	TObjectPtr<UTextureRenderTargetCube> SkyCubeRT;
@@ -110,19 +93,16 @@ private:
 	/** 上次绑定时使用的 MID；MID 若被重建（例如改材质/改设置），贴图参数需要重新绑一次 */
 	TWeakObjectPtr<UMaterialInstanceDynamic> LastBoundMID;
 
-	/** RT 刚创建 / 刚重建：需要立刻把 6 个面全烘一遍，避免开头几帧天空是黑的 */
-	bool bNeedsFullBake = true;
+	/** RT 刚创建 / 刚重建：下一帧无条件烘一次，避免开头天空是黑的 */
+	bool bNeedsBake = true;
 
 	bool bSkyEnabled = true;
 	bool bLoggedNotReady = false;
 
 	float SkyTime = 0.0f;
 
-	/** 累计调度时钟（只在 Tick 里累加，与 SkyTimeScale 无关） */
-	float ScheduleClock = 0.0f;
-
-	/** 每个面上次被烘的时间（ScheduleClock 单位） */
-	float FaceLastUpdateTime[6] = { -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f };
+	/** 距下次烘焙还剩多少秒 */
+	float TimeUntilNextBake = 0.0f;
 
 	int32 CubeResolution = 0;
 };
